@@ -29,6 +29,46 @@ from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
 
+
+def _resolve_grpo_autocast_dtype(args, model = None):
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+        return None
+
+    use_bf16 = getattr(args, "bf16", False)
+    if type(use_bf16) is bool and use_bf16:
+        return torch.bfloat16
+
+    use_fp16 = getattr(args, "fp16", False)
+    if type(use_fp16) is bool and use_fp16:
+        return torch.float16
+
+    mixed_precision = getattr(args, "mixed_precision", None)
+    if mixed_precision == "bf16":
+        return torch.bfloat16
+    if mixed_precision == "fp16":
+        return torch.float16
+    if mixed_precision == "no":
+        return None
+
+    mixed_precision = os.environ.get("ACCELERATE_MIXED_PRECISION", None)
+    if mixed_precision == "bf16":
+        return torch.bfloat16
+    if mixed_precision == "fp16":
+        return torch.float16
+    if mixed_precision == "no":
+        return None
+
+    if model is not None:
+        from .utils import _get_dtype
+        dtype = getattr(getattr(model, "config", None), "dtype", None) or getattr(getattr(model, "config", None), "torch_dtype", None)
+        if dtype is None and hasattr(model, "get_input_embeddings"):
+            dtype = model.get_input_embeddings().weight.dtype
+        dtype = _get_dtype(dtype)
+        if dtype in (torch.float16, torch.bfloat16):
+            return dtype
+
+    return torch.float16
+
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
@@ -682,8 +722,7 @@ def grpo_accumulated_loss(
     n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
 
     if not hasattr(trainer, '_autocast_dtype'):
-        trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
-        if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = None
+        trainer._autocast_dtype = _resolve_grpo_autocast_dtype(trainer.args, trainer.model)
     pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
