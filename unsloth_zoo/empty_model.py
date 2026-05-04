@@ -21,9 +21,12 @@ __all__ = [
     "get_model_layer_config",
     "compare_attributes",
     "copy_attributes",
+    "resolve_embed_attr",
+    "resolve_norm_attr",
 ]
 
 import torch
+import torch.nn as nn
 import re
 import os
 from copy import deepcopy
@@ -182,8 +185,18 @@ def copy_attributes(original_model, new_model):
     dict_copied_count = 0
     dict_skipped_count = 0
 
-    for (name, module), (_, original_module) in zip(new_model.named_modules(), original_model.named_modules()):
-        buffer_names = [name for name,_ in original_module.named_buffers(recurse=False)]
+    # Build name->module lookup for original model to handle mismatched structures.
+    # The new_model is created from a shrunken config (e.g. n_routed_experts=1) which
+    # can produce a different number of submodules than the original. 
+    # Name based lookup ensures we only copy attributes between modules that share the same path, 
+    # avoiding misalignment that positional zip would cause.
+    original_modules = dict(original_model.named_modules())
+
+    for name, module in new_model.named_modules():
+        original_module = original_modules.get(name)
+        if original_module is None:
+            continue
+        buffer_names = [n for n, _ in original_module.named_buffers(recurse=False)]
         for attr in dir(original_module):
             if attr.startswith('_'):
                 continue
@@ -229,6 +242,19 @@ def copy_attributes(original_model, new_model):
             else:
                 print(f"    Sample: {skipped_attrs[:5]}... and {skipped_count-5} more")
 pass
+
+def resolve_embed_attr(model: nn.Module) -> str:
+    """Return the embedding attribute name: 'embeddings' (e.g. NemotronH) or 'embed_tokens' (standard)."""
+    if hasattr(model, "embeddings") and not hasattr(model, "embed_tokens"):
+        return "embeddings"
+    return "embed_tokens"
+
+
+def resolve_norm_attr(model: nn.Module) -> str:
+    """Return the final norm attribute name: 'norm_f' (e.g. NemotronH) or 'norm' (standard)."""
+    if hasattr(model, "norm_f") and not hasattr(model, "norm"):
+        return "norm_f"
+    return "norm"
 
 
 @torch.inference_mode
@@ -279,6 +305,23 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     new_config.head_dim = 1
     new_config.vocab_size = 1
     new_config.pad_token_id = 0
+
+    _set_config_attrs(new_config, {
+        # Mamba SSM dimensions
+        "mamba_num_heads": 1,
+        "mamba_head_dim": 1,
+        "ssm_state_size": 1,
+        "mamba_d_state": 1,
+        "mamba_d_conv": 1,
+        "n_groups": 1,
+        # MoE dimensions
+        "moe_intermediate_size": 1,
+        "moe_shared_expert_intermediate_size": 1,
+        "n_routed_experts": 1,
+        "num_local_experts": 1,
+        "num_experts": 1,
+        "num_experts_per_tok": 1,
+    })
 
     # Set attention module head_dim
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -408,7 +451,11 @@ def set_additional_modules(new_model, quant_state_dict, config):
         language_model = new_model.model
 
     # Embeddings
+    # resolve_embed_attr tells us which ATTRIBUTE to set on the HF model.
+    # The STATE DICT KEY may use a different name (vLLM seems to normalize to embed_tokens)
+    _embed_attr = resolve_embed_attr(language_model)
     embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
+
     # Use explicit None check since pad_token_id=0 is valid (0 is falsy in Python)
     pad_token_id = getattr(config, "pad_token_id", None)
     if pad_token_id is None:
@@ -435,24 +482,25 @@ def set_additional_modules(new_model, quant_state_dict, config):
         module.num_embeddings = num_embeddings
         module.embedding_dim = embedding_dim
 
-    set_embedding(language_model.embed_tokens, embed_tokens_key, pad_token_id) # This sets the embedding that we generally find in language (sub)model
+    set_embedding(getattr(language_model, _embed_attr), embed_tokens_key, pad_token_id) # This sets the embedding that we generally find in language (sub)model
 
     if 'model.visual.pos_embed.weight' in quant_state_dict:
         # This is to handle visual embeddings in Qwen 3 VL
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
     # Norm
-    norm_key = f"{language_model_prefix}.norm.weight"
+    _norm_attr = resolve_norm_attr(language_model)
+    norm_key = f"{language_model_prefix}.{_norm_attr}.weight"
     norm = quant_state_dict[norm_key]
     norm = torch.nn.Parameter(norm, requires_grad = False)
-    language_model.norm.weight = norm
+    getattr(language_model, _norm_attr).weight = norm
 
     # LM Head. Do note that for some models, like Mistral3ForConditionalGeneration,
     # there can be mismatch in the value of tie_word_embeddings between config and text_config
     # we prefer picking the one in text_config. If you notice any issue later, please report it!
     text_config = getattr(config, "text_config", config)
     if getattr(text_config, "tie_word_embeddings", False):
-        lmhead_key = f"{language_model_prefix}.embed_tokens.weight"
+        lmhead_key = embed_tokens_key
     else:
         lmhead_key = "lm_head.weight"
 
@@ -539,6 +587,47 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
+
+            ### Hybrid Models
+            # NemotronH uses a unified "mixer" submodule per layer instead of separate
+            # self_attn + mlp. The layer type varies per position according to a
+            # hybrid_override_pattern string in config (* = attention, M = mamba, E = MoE, - = dense/mlp).
+
+            ## Attention mixer (layers with * in hybrid_override_pattern)
+            "model.layers.{kk}.mixer.q_proj",
+            "model.layers.{kk}.mixer.k_proj",
+            "model.layers.{kk}.mixer.v_proj",
+            "model.layers.{kk}.mixer.o_proj",
+
+            ## Mamba/SSM mixer (layers with M in hybrid_override_pattern)
+            # Linear projections are handled as standard nn.Linear by the template loop
+            "model.layers.{kk}.mixer.in_proj",
+            "model.layers.{kk}.mixer.out_proj",
+            # Conv1d is preserved by the template loop (3D weight, not nn.Linear)
+            "model.layers.{kk}.mixer.conv1d",
+            # Raw parameters (no .weight suffix -> nn.Parameter exec path)
+            "model.layers.{kk}.mixer.A_log",
+            "model.layers.{kk}.mixer.D",
+            "model.layers.{kk}.mixer.dt_bias",
+
+            ## MoE mixer (layers with E in hybrid_override_pattern)
+            # Expert 3D parameters (no .weight suffix -> nn.Parameter exec path)
+            # Shape: [n_experts, intermediate_size, hidden_size] (up_proj)
+            # Shape: [n_experts, hidden_size, intermediate_size] (down_proj)
+            "model.layers.{kk}.mixer.experts.up_proj",
+            "model.layers.{kk}.mixer.experts.down_proj",
+            # Gate/router preserved by the template loop (not nn.Linear, keeps
+            # TopkRouter class and its routing forward())
+            "model.layers.{kk}.mixer.gate",
+            # Gate score correction bias (no .weight suffix -> nn.Parameter exec path)
+            "model.layers.{kk}.mixer.gate.e_score_correction_bias",
+            # Shared experts (standard Linear modules)
+            "model.layers.{kk}.mixer.shared_experts.up_proj",
+            "model.layers.{kk}.mixer.shared_experts.down_proj",
+
+            ## Dense MLP mixer (layers with - in hybrid_override_pattern)
+            "model.layers.{kk}.mixer.up_proj",
+            "model.layers.{kk}.mixer.down_proj",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -567,6 +656,14 @@ def get_model_layer_config(return_non_layered=True):
 
             # qwen3 vl
             "model.visual.deepstack_merger_list.{kk}.norm",
+
+            ### Hybrid Models
+
+            ## NemotronH
+            # Per-layer norm (NemotronH: every layer has layers.N.norm)
+            "model.layers.{kk}.norm",
+            # Mamba mixer internal norm (between SSM output and gating)
+            "model.layers.{kk}.mixer.norm",
         },
         'vision_layers': {
 

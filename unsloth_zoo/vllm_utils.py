@@ -44,6 +44,7 @@ import ast
 import sys
 import shutil
 import torch
+import torch.nn as nn
 from torch import __version__ as torch_version
 import json
 import psutil
@@ -92,6 +93,300 @@ pass
 def _return_nothing(*args, **kwargs): return None
 def _return_self(self, *args, **kwargs): return self
 def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
+
+
+def _get_module_at_path(model, dotted_path: str):
+    """Navigate to a submodule by its state-dict key prefix.
+
+    Used in convert_vllm_to_huggingface to check what module type exists at a
+    given path in the empty model, so we can decide whether to replace it with
+    a plain nn.Linear or preserve it (e.g. Conv1d, TopkRouter).
+
+    Args:
+        model: root nn.Module (new_model)
+        dotted_path: e.g. "model.layers.0.mixer.gate"
+
+    Returns:
+        The nn.Module at that path, or None if the path doesn't resolve.
+    """
+    parts = dotted_path.split(".")
+    obj = model
+    for part in parts:
+        if part.isdigit():
+            try:
+                obj = obj[int(part)]
+            except (IndexError, KeyError, TypeError):
+                return None
+        else:
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return None
+    return obj
+
+
+def is_hybrid_mixer_layer(layer: nn.Module) -> bool:
+    """True if this layer uses a unified 'mixer' submodule instead of separate
+    self_attn + mlp."""
+    return hasattr(layer, "mixer") and not hasattr(layer, "self_attn")
+
+def classify_mixer(mixer: nn.Module) -> str:
+    """Classify a mixer submodule by its structure (not model_type strings).
+
+    Returns:
+        "attention" - has qkv_proj (fused Q/K/V for vLLM) and o_proj
+        "mamba"     - has conv1d and A parameter
+        "moe"       - has experts submodule
+        "dense"     - has up_proj/down_proj but no experts
+
+    Raises RuntimeError if the mixer doesn't match any known pattern.
+    """
+    if hasattr(mixer, "qkv_proj"):
+        return "attention"
+    if hasattr(mixer, "conv1d") and (hasattr(mixer, "A") or hasattr(mixer, "A_log")):
+        return "mamba"
+    if hasattr(mixer, "experts"):
+        return "moe"
+    # Dense MLP: has up_proj/down_proj but no experts (e.g. the 4B dense NemotronH Models )
+    if hasattr(mixer, "up_proj") or hasattr(mixer, "down_proj"):
+        return "dense"
+    raise RuntimeError(
+        f"Unsloth: Cannot classify mixer layer. "
+        f"Children: {[n for n, _ in mixer.named_children()]}"
+    )
+
+
+def _put(sd: Optional[dict], qsd: dict, key: str, data):
+    """Store a tensor in both state_dict and quant_state_dict."""
+    qsd[key] = data
+    if sd is not None:
+        sd[key] = data
+
+
+def _extract_mixer_attention(mixer, prefix, sd, qsd, get_state_dict_fn):
+    """Extract attention mixer weights using get_state_dict_fn for QKV split.
+
+    vLLM fuses Q/K/V into mixer.qkv_proj. Index 0=Q, 1=K, 2=V.
+    """
+    get_state_dict_fn(f"{prefix}.q_proj", 0, sd, mixer.qkv_proj)
+    get_state_dict_fn(f"{prefix}.k_proj", 1, sd, mixer.qkv_proj)
+    get_state_dict_fn(f"{prefix}.v_proj", 2, sd, mixer.qkv_proj)
+    get_state_dict_fn(f"{prefix}.o_proj", 0, sd, mixer.o_proj, slice_weights=False)
+
+
+def _extract_mixer_mamba(mixer, prefix, sd, qsd):
+    """Extract Mamba/SSM mixer weights.
+
+    A_log conversion (vLLM -> HuggingFace):
+        HuggingFace stores A_log as a learnable parameter:
+            A = -torch.exp(self.A_log.float())   # in forward()
+        vLLM pre-computes and caches the exponentiated form:
+            self.A = -torch.exp(loaded_weight)    # at load time
+        To convert back:
+            A_log = torch.log(-A_vllm)
+    """
+    # Linear projections
+    for name in ("in_proj", "out_proj"):
+        proj = getattr(mixer, name, None)
+        if proj is not None:
+            base = getattr(proj, "base_layer", proj)
+            if hasattr(base, "weight"):
+                _put(sd, qsd, f"{prefix}.{name}.weight", base.weight.data)
+                if getattr(base, "bias", None) is not None:
+                    _put(sd, qsd, f"{prefix}.{name}.bias", base.bias.data)
+
+    # Conv1d (weight + bias)
+    conv = getattr(mixer, "conv1d", None)
+    if conv is not None:
+        _put(sd, qsd, f"{prefix}.conv1d.weight", conv.weight.data)
+        if getattr(conv, "bias", None) is not None:
+            _put(sd, qsd, f"{prefix}.conv1d.bias", conv.bias.data)
+
+    # A parameter: convert from vLLM's pre-exponentiated form back to A_log
+    A = getattr(mixer, "A", None)
+    if A is not None:
+        A_data = A.data if isinstance(A, nn.Parameter) else A
+        _put(sd, qsd, f"{prefix}.A_log", torch.log(-A_data))
+
+    # Scalar/vector parameters (D, dt_bias)
+    for name in ("D", "dt_bias"):
+        param = getattr(mixer, name, None)
+        if param is not None:
+            _put(sd, qsd, f"{prefix}.{name}",
+                 param.data if isinstance(param, nn.Parameter) else param)
+
+    # Mamba internal norm (e.g. Zamba2RMSNormGated between SSM output and gating)
+    norm = getattr(mixer, "norm", None)
+    if norm is not None and hasattr(norm, "weight"):
+        _put(sd, qsd, f"{prefix}.norm.weight", norm.weight.data)
+
+
+def _extract_mixer_moe(mixer, prefix, sd, qsd):
+    """Extract MoE mixer weights (experts + gate + shared_experts).
+
+    vLLM FusedMoE expert weight layout:
+        w13_weight: [num_experts, fused_dim, hidden_size]
+            - Gated MoE (SiLU):   fused_dim = 2 * intermediate (gate + up concat)
+            - Non-gated (relu2):   fused_dim = intermediate (up only)
+        w2_weight:  [num_experts, hidden_size, intermediate_size]
+
+    NemotronH uses non-gated MoE (squared_relu), so w13 is just up_proj.
+
+    HuggingFace NemotronHExperts stores experts as 3D nn.Parameters:
+        experts.up_proj:   [n_experts, intermediate, hidden]
+        experts.down_proj: [n_experts, hidden, intermediate]
+    State dict keys have NO .weight suffix (they're raw parameters).
+    """
+    experts_mod = mixer.experts
+    base_experts = getattr(experts_mod, "base_layer", experts_mod)
+
+    w13 = getattr(base_experts, "w13_weight", None)
+    w2 = getattr(base_experts, "w2_weight", None)
+
+    if w13 is None or not hasattr(w13, "shape"):
+        raise RuntimeError(
+            f"Unsloth: MoE layer at '{prefix}' missing w13_weight. "
+            f"Attrs: {[a for a in dir(base_experts) if not a.startswith('_')]}"
+        )
+
+    w_up = w13.data if isinstance(w13, nn.Parameter) else w13
+    w_down = w2.data if isinstance(w2, nn.Parameter) else w2
+
+    # NemotronH uses non-gated MoE (squared_relu): w13 IS up_proj directly
+    _put(sd, qsd, f"{prefix}.experts.up_proj", w_up)
+    _put(sd, qsd, f"{prefix}.experts.down_proj", w_down)
+
+    # Gate (router) -> unwrap TopkRouter to get the inner Linear weight
+    # vLLM: gate = TopkRouter(layer=nn.Linear(hidden, num_experts))
+    # or gate has .weight directly on TopkRouter
+    gate = getattr(mixer, "gate", None)
+    if gate is not None:
+        inner = getattr(gate, "layer", gate)
+        if hasattr(inner, "weight"):
+            _put(sd, qsd, f"{prefix}.gate.weight", inner.weight.data)
+        if getattr(inner, "bias", None) is not None:
+            _put(sd, qsd, f"{prefix}.gate.bias", inner.bias.data)
+        e_bias = getattr(gate, "e_score_correction_bias",
+                         getattr(inner, "e_score_correction_bias", None))
+        if e_bias is not None:
+            _put(sd, qsd, f"{prefix}.gate.e_score_correction_bias",
+                 e_bias.data if isinstance(e_bias, nn.Parameter) else e_bias)
+
+    # Shared experts (standard Linear projections)
+    shared = getattr(mixer, "shared_experts", None)
+    if shared is not None:
+        for name in ("up_proj", "down_proj"):
+            proj = getattr(shared, name, None)
+            if proj is not None:
+                base = getattr(proj, "base_layer", proj)
+                if hasattr(base, "weight"):
+                    _put(sd, qsd, f"{prefix}.shared_experts.{name}.weight", base.weight.data)
+                    if getattr(base, "bias", None) is not None:
+                        _put(sd, qsd, f"{prefix}.shared_experts.{name}.bias", base.bias.data)
+
+
+def _extract_mixer_dense(mixer, prefix, sd, qsd, get_state_dict_fn):
+    """Extract dense MLP mixer weights (up_proj, down_proj).
+
+    NemotronH 4B uses non-gated MLP (relu2), so only up_proj + down_proj.
+    """
+    down_proj = getattr(mixer, "down_proj", None)
+    if down_proj is not None:
+        get_state_dict_fn(f"{prefix}.down_proj", 0, sd, down_proj, slice_weights=False)
+
+    up_proj = getattr(mixer, "up_proj", None)
+    if up_proj is not None:
+        get_state_dict_fn(f"{prefix}.up_proj", 0, sd, up_proj, slice_weights=False)
+
+def extract_hybrid_layer(layer, kk, prefix, sd, qsd, get_state_dict_fn):
+    """Extract all weights from a single hybrid mixer layer into the state dicts.
+
+    Dispatches based on the mixer's structure:
+        Attention (qkv_proj): splits fused QKV via get_state_dict_fn
+        Mamba (conv1d + A):   extracts projections, conv1d, A_log, D, dt_bias
+        MoE (experts):        extracts 3D expert params, gate, shared experts
+
+    Also extracts the per-layer norm.
+
+    Args:
+        layer: vLLM layer module (has .mixer and .norm)
+        kk: layer index
+        prefix: state dict prefix (e.g. "model")
+        sd: state_dict (None if return_state_dict=False)
+        qsd: quant_state_dict (always populated)
+        get_state_dict_fn: stock get_state_dict closure for extraction
+    """
+    mixer = layer.mixer
+    mixer_prefix = f"{prefix}.layers.{kk}.mixer"
+    layer_type = classify_mixer(mixer)
+
+    if layer_type == "attention":
+        _extract_mixer_attention(mixer, mixer_prefix, sd, qsd, get_state_dict_fn)
+    elif layer_type == "mamba":
+        _extract_mixer_mamba(mixer, mixer_prefix, sd, qsd)
+    elif layer_type == "moe":
+        _extract_mixer_moe(mixer, mixer_prefix, sd, qsd)
+    elif layer_type == "dense":
+        _extract_mixer_dense(mixer, mixer_prefix, sd, qsd, get_state_dict_fn)
+
+    # Per-layer norm (every NemotronH layer has layers.N.norm)
+    norm = getattr(layer, "norm", None)
+    if norm is not None and hasattr(norm, "weight"):
+        _put(sd, qsd, f"{prefix}.layers.{kk}.norm.weight", norm.weight.data)
+
+
+def hybrid_memory_estimate(config) -> Optional[int]:
+    """Compute a weighted-average intermediate_size for a hybrid layer pattern.
+
+    Returns an equivalent intermediate_size that the stock memory formula
+    (hidden * intermediate * 3 * n_layers) can use, or None if not hybrid.
+
+    NemotronH MoE has 3 layer types with different parameter counts:
+        Attention: qkvo projections (~4 * hidden * head_dim * n_heads)
+        Mamba: in_proj + out_proj (~2 * hidden * d_inner)
+        MoE: n_experts * intermediate * n_proj + shared_experts
+    TODO: dense hybrid mixer models handling (e.g. 4B dense NemotronH with up/down_proj but no experts)
+    """
+    hybrid_pattern = getattr(config, "hybrid_override_pattern", None)
+    if not hybrid_pattern:
+        return None
+
+    n_layers = config.num_hidden_layers
+    if len(hybrid_pattern) != n_layers:
+        return None
+
+    n_attn = hybrid_pattern.count("*")
+    n_mamba = hybrid_pattern.count("M")
+    n_moe = hybrid_pattern.count("E")
+
+    if n_attn + n_mamba + n_moe != n_layers:
+        return None
+
+    hd = config.hidden_size
+
+    # Dense MLP cost (for attention layers)
+    mlp_dense = hd * config.intermediate_size * 3
+
+    # Mamba cost: in_proj + out_proj
+    mamba_expand = getattr(config, "expand", 2)
+    d_inner = hd * mamba_expand
+    mlp_mamba = d_inner * hd * 2  # in_proj + out_proj
+
+    # MoE cost
+    n_experts = (getattr(config, "n_routed_experts", None) or
+                 getattr(config, "num_local_experts", 1))
+    moe_inter = getattr(config, "moe_intermediate_size", config.intermediate_size)
+    is_non_gated = getattr(config, "mlp_hidden_act", "") in ("squared_relu", "relu2")
+    n_proj = 2 if is_non_gated else 3
+    mlp_moe = n_experts * hd * moe_inter * n_proj
+    shared_inter = getattr(config, "moe_shared_expert_intermediate_size", 0) or 0
+    if shared_inter:
+        mlp_moe += hd * shared_inter * n_proj
+
+    # Weighted average -> equivalent intermediate for stock formula
+    total_mlp = n_attn * mlp_dense + n_mamba * mlp_mamba + n_moe * mlp_moe
+    equiv_intermediate = total_mlp // (n_layers * hd * 3)
+    return max(equiv_intermediate, 1)
+
 
 def get_target_device(index = 0):
     if DEVICE_TYPE == "hip":
@@ -1038,7 +1333,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         # for mllama, prefer using org_vocab_size which is text_config.vocab_size + 8
         # https://github.com/huggingface/transformers/blob/1cea763ba422b83778a8db0374ea90f43b09992b/src/transformers/models/mllama/modeling_mllama.py#L1147
         shrink_size = getattr(proj,"org_vocab_size", vocab_size)
-        if shrink_size and ("embed_tokens" in prefix or "lm_head" in prefix):
+        # _embed_attr is resolved before first call via resolve_embed_attr()
+        if shrink_size and (_embed_attr in prefix or "lm_head" in prefix):
             if weight.shape[0] > shrink_size:
                 weight = weight[:shrink_size]
 
@@ -1055,7 +1351,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 bias_tensor = bias
 
             # Apply vocab_size truncation for bias as well
-            if shrink_size is not None and ("embed_tokens" in prefix or "lm_head" in prefix):
+            if shrink_size is not None and (_embed_attr in prefix or "lm_head" in prefix):
                 if bias_tensor.shape[0] > shrink_size:
                     bias_tensor = bias_tensor[:shrink_size]
 
@@ -1074,9 +1370,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     else:
         raise RuntimeError(f'Unsloth: Cannot find vllm_internal_model!')
 
-    embed_tokens = vllm_text_model.embed_tokens
+    _embed_attr = resolve_embed_attr(vllm_text_model)
+    embed_tokens = getattr(vllm_text_model, _embed_attr)
     # Use get_state_dict for consistent extraction and automatic truncation
-    get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
+    get_state_dict(f"{vllm_text_model_prefix}.{_embed_attr}", 0, state_dict, embed_tokens, slice_weights=False)
 
     # Get layer configuration for this model type
     layer_config = get_model_layer_config()
@@ -1093,6 +1390,13 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     skipped_layernorms = []
     for kk in range(len(vllm_text_model.layers)):
         layer = vllm_text_model.layers[kk]
+
+        # Hybrid mixer layers (NemotronH: attention/mamba/moe under unified .mixer)
+        if is_hybrid_mixer_layer(layer):
+            extract_hybrid_layer(layer, kk, vllm_text_model_prefix, state_dict, quant_state_dict, get_state_dict)
+            # Layernorms for hybrid layers are extracted by extract_hybrid_layer
+            continue
+
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
             qkv_proj = layer.self_attn.qkv_proj
@@ -1161,8 +1465,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     # Norm
     # For Gemma3 and similar multimodal models, norm should be under model.norm
     # For standard models, also under model.norm
-    norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
-    state_dict[norm_prefix] = vllm_text_model.norm.weight.data
+    # For hybrid models it can be under norm_f (or even different names)
+    _norm_attr = resolve_norm_attr(vllm_text_model)
+    norm_prefix = f"{vllm_text_model_prefix}.{_norm_attr}.weight"
+    state_dict[norm_prefix] = getattr(vllm_text_model, _norm_attr).weight.data
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # LM Head - Use get_state_dict for consistency
@@ -1172,7 +1478,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         get_state_dict("lm_head", 0, state_dict, lm_layer[0], slice_weights=False)
     else:
         # Fallback to embed_tokens for tied embeddings
-        embed_key = f"{vllm_text_model_prefix}.embed_tokens.weight"
+        embed_key = f"{vllm_text_model_prefix}.{_embed_attr}.weight"
         if embed_key in state_dict:
             lm_weight = state_dict[embed_key]
             state_dict["lm_head.weight"] = lm_weight
@@ -1351,8 +1657,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if fp8_weight_scale is not None: assert fp8_weight_scale.ndim in [1,2], f"we only support row quantized (ndim=1) and block quantized(ndim=2) fp8 but found {fp8_weight_scale.ndim}"
 
             if layer_name in quant_state_dict:
-                # for attributes of type nn.Parameter, there's no .weight
-                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
+                # For attributes of type nn.Parameter, there's no .weight suffix
+                # (e.g. hybrid model keys: mixer.A_log, mixer.D, mixer.dt_bias,
+                # mixer.experts.up_proj, mixer.gate.e_score_correction_bias).
+                # Keep the full path including "model." so exec resolves correctly
+                # via new_model.model.layers[N]...
+                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
                 layer = torch.nn.Parameter(weight, requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
                 continue
@@ -1396,22 +1706,38 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.to = partial(_override_to, layer)
                 layer.weight.to = partial(_override_to, layer.weight)
 
-            elif not any(x in layer_name for x in layernorm_names):
-                layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
-                layer.in_features  = weight.shape[1]
-                layer.out_features = weight.shape[0]
-                # from vllm 0.11.1, the .weight is of dtype ModelWeightParameter, so try to extract the 'data' part
-                # https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170#diff-7d6145ac4ba084231a441c2056c7fca23c3bae33e6542f4f602a6c9d4d2da64dL199-R208
-                layer.weight = torch.nn.Parameter(getattr(weight, 'data', weight), requires_grad = False)
-                layer.bias = bias
+            elif weight.ndim == 2 and not any(x in layer_name for x in layernorm_names):
+                # 2D weight, not a layernorm so either a standard Linear projection
+                # or a specialized module (e.g. TopkRouter) that must be preserved.
+                existing_module = _get_module_at_path(new_model, layer_name)
+                if existing_module is None or isinstance(existing_module, nn.Linear):
+                    # Standard Linear: safe to create a new module and replace.
+                    layer = Linear(0, 0, device = get_target_device(), bias = has_bias)
+                    layer.in_features  = weight.shape[1]
+                    layer.out_features = weight.shape[0]
+                    # from vllm 0.11.1, the .weight is of dtype ModelWeightParameter, so try to extract the 'data' part
+                    # https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170#diff-7d6145ac4ba084231a441c2056c7fca23c3bae33e6542f4f602a6c9d4d2da64dL199-R208
+                    layer.weight = torch.nn.Parameter(getattr(weight, 'data', weight), requires_grad = False)
+                    layer.bias = bias
+                else:
+                    # Specialized module with 2D weight (e.g. TopkRouter with routing
+                    # logic). Preserve the module's class and forward() & only load weight.
+                    weight_param = torch.nn.Parameter(weight, requires_grad=False)
+                    layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
+                    exec(f"new_model.{layer_name_br}.weight = None")
+                    exec(f"new_model.{layer_name_br}.weight = weight_param")
+                    if bias is not None:
+                        exec(f"new_model.{layer_name_br}.bias = None")
+                        exec(f"new_model.{layer_name_br}.bias = bias")
+                    continue
             else:
-                # LayerNorms (including vision norms)
+                # Preserve existing module: LayerNorms (including vision norms), Conv1d (3D weight), and any
+                # other non-Linear module. These are instantiated by create_empty_model, 
+                # therefore we only set the weight to keep the module's class and forward() method intact.
                 weight_param = torch.nn.Parameter(weight, requires_grad=False)
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-                # Set weight
                 exec(f"new_model.{layer_name_br}.weight = None")
                 exec(f"new_model.{layer_name_br}.weight = weight_param")
-                # Set bias if it exists
                 if bias is not None:
                     exec(f"new_model.{layer_name_br}.bias = None")
                     exec(f"new_model.{layer_name_br}.bias = bias")
